@@ -6,7 +6,7 @@ Run (from any directory):
     blender -b -P create_animation.py -- [options]
 
 Options (all optional):
-    --ref PATH            reference image (default: ./source/reference_16x9.webp next to this script)
+    --ref PATH            reference image (default: ./source/reference_v3.jpg next to this script)
     --out DIR             output directory (default: directory of this script)
     --seconds S           loop duration (default 16)
     --fps F               frame rate (default 30)
@@ -42,7 +42,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 def parse_args():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
     cfg = {
-        "ref": os.path.join(SCRIPT_DIR, "source", "reference_16x9.webp"),
+        "ref": os.path.join(SCRIPT_DIR, "source", "reference_v3.jpg"),
         "out": SCRIPT_DIR,
         "seconds": 16.0,
         "fps": 30,
@@ -106,10 +106,14 @@ FOCAL = SENSOR_H * CAM_DIST / 2.0   # frame half-height at z=0 is exactly 1 BU
 IMG_SIZE = 2.0          # image plane height (BU); width = IMG_SIZE * ASPECT
 OVERSCAN = 1.04         # bubble planes slightly larger than the frame so their float never shows an edge
 
-# Centre of the background iris behind the BETA wordmark (fraction of the 1672x940
-# reference, x right, y down). Used to seed the central body and to keep the
-# lines around the wordmark out of the cell detection.
-IRIS_REL = (944.0 / 1672, 490.1 / 940)
+# Layout of the reference (fractions of width / height, x right, y down):
+# the BETA wordmark sits at LOGO_REL; the two bubble clusters grow from the corner
+# boxes below. Everything that is not part of those two clusters stays static
+# (wordmark, wire sphere, iris lines, the faint curves upper-left and the line
+# tangle lower-right).
+LOGO_REL = (0.47, 0.45)
+TR_SEED_BOX = (0.80, 1.00, 0.00, 0.25)     # x0, x1, y0, y1
+BL_SEED_BOX = (0.00, 0.12, 0.75, 1.00)
 
 ASPECT = 16 / 9         # replaced by the real image aspect in build_layers()
 TEX_DIR = os.path.join(CFG["out"], "textures")
@@ -385,16 +389,20 @@ def build_layers(ref_path):
 
     # Central body: wordmark + iris lines + wire sphere form one connected bright body.
     occ = _dilate(small > 0.18, 2)
-    seed = np.zeros_like(occ)
-    sy, sx = int(IRIS_REL[1] * hh), int(IRIS_REL[0] * ww)
-    seed[sy - 10:sy + 10, sx - 10:sx + 10] = True
-    centre = _reconstruct(seed, occ)
-    # Everything else that is visible: the bubble clusters framing the subject,
-    # split along the diagonal into an upper-right and a lower-left group.
-    other = _dilate(small > 0.05, 2) & ~_dilate(centre, 6)
     yy, xx = np.mgrid[0:hh, 0:ww]
-    tr = other & (yy * ww < xx * hh)
-    bl = other & ~(yy * ww < xx * hh)
+    seed = (np.abs(yy - LOGO_REL[1] * hh) < 8) & (np.abs(xx - LOGO_REL[0] * ww) < 8)
+    centre = _reconstruct(seed, occ)
+
+    # Bubble clusters: bright cores connected to their corner, then grown through the
+    # dimmer membranes while keeping clear of the central body.
+    def box(b):
+        return (xx >= b[0] * ww) & (xx < b[1] * ww) & (yy >= b[2] * hh) & (yy < b[3] * hh)
+    grow = (_dilate(small > 0.07, 1) | occ) & ~_dilate(centre, 10)
+    tr = _reconstruct(_reconstruct(box(TR_SEED_BOX), occ), grow)
+    bl = _reconstruct(_reconstruct(box(BL_SEED_BOX), occ), grow)
+    if (tr & bl).any() or (tr & centre).any() or (bl & centre).any():
+        raise SystemExit("bubble clusters are not separable from each other / the wordmark")
+    rest = (small > 0.03) & ~tr & ~bl                  # everything else visible stays static
 
     def up(b):
         big = np.kron(b.astype(np.float32), np.ones((f, f), np.float32))
@@ -403,7 +411,7 @@ def build_layers(ref_path):
         return out
 
     sig = 10 * h / 1600
-    c_s = _blur(up(_dilate(centre, 4)), sig)
+    c_s = _blur(up(_dilate(rest, 2)), sig)
     tr_s = _blur(up(_dilate(tr, 4)), sig)
     bl_s = _blur(up(_dilate(bl, 4)), sig)
     tot = c_s + tr_s + bl_s + 1e-3
@@ -413,8 +421,9 @@ def build_layers(ref_path):
 
     # Colour layers are Lanczos-resampled to the render resolution here (Cycles' own
     # "Cubic" is a smoothing B-spline), then sampled ~1:1 with linear filtering.
-    out_w = CFG["res"][0]
-    out_h = int(round(out_w / ASPECT))
+    # The image fills the frame height; a slightly wider aspect is cropped at the sides.
+    out_h = CFG["res"][1]
+    out_w = int(round(out_h * ASPECT))
     paths = {}
     for name, wt in (("layer_centre", w_c), ("layer_foam_tr", w_tr), ("layer_foam_bl", w_bl)):
         layer = _resample(lin * wt[..., None], out_w, out_h)
