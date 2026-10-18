@@ -24,6 +24,7 @@ with integer k only. Frame N is therefore mathematically identical to frame 0,
 including velocity and acceleration.
 """
 
+import bmesh
 import bpy
 import math
 import os
@@ -95,7 +96,7 @@ AMP = 0.0 if CFG["identity"] else 1.0
 # Loop frequencies (whole cycles per loop; must be integers for loop closure)
 K_SWELL = 4             # each cell swells and relaxes 4x per loop (every 4 s at 16 s)
 K_DRIFT = 3             # each cell drifts on a small orbit 3x per loop (every 5.3 s)
-K_RIPPLE = 1            # membrane ripple evolves once around per loop
+K_RIPPLE = 2            # membrane ripple field rotates through its two noise bases 2x per loop
 
 # Scene geometry: the 16:9 reference fills the frame at z=0 (frame height = 2 BU).
 CAM_DIST = 5.0          # camera distance from the image plane (BU)
@@ -113,6 +114,7 @@ ASPECT = 16 / 9         # replaced by the real image aspect in build_layers()
 TEX_DIR = os.path.join(CFG["out"], "textures")
 CELL_STATS = {}
 CELL_FIELD_RANGE = None  # stored displacement range (image-height units); set from the data
+SUPPORT = {}            # low-res masks of where each bubble layer can ever show content
 
 
 # ----------------------------------------------------------------------------
@@ -313,13 +315,23 @@ def build_cell_fields(cells, w, h, seed=7):
         F["s2"][sl] += np.stack([-sp * orb, cp * orb], -1)
         F["c2"][sl] += np.stack([cp * orb, sp * orb], -1)
 
+    # Membrane ripple: two independent smooth noise vector fields N1, N2 (feature size
+    # ~1/10 of the image height, std ~1 px of the reference), combined in the shader
+    # as cos(th) N1 + sin(th) N2 -- periodic, with constant variance over the loop.
+    for key in ("n1", "n2"):
+        v = np.stack([_blur(rng.standard_normal((fh, fw)).astype(np.float32), fh / 10 / 4.0)
+                      for _ in range(2)], -1)
+        F[key] = (v / v.std() * (1.0 / h)).astype(np.float32)
+
     def min_jacobian(scale):
         """Smallest det(I - grad d) over a grid of phases: must stay > 0 (no fold-over)."""
         worst = np.inf
         for t1 in np.linspace(0, 2 * np.pi, 12, endpoint=False):
             for t2 in np.linspace(0, 2 * np.pi, 8, endpoint=False):
+                t3 = t1 * 0.7 + t2
                 d = scale * (math.sin(t1) * F["s1"] + math.cos(t1) * F["c1"]
-                             + math.sin(t2) * F["s2"] + math.cos(t2) * F["c2"])
+                             + math.sin(t2) * F["s2"] + math.cos(t2) * F["c2"]) \
+                    + math.cos(t3) * F["n1"] + math.sin(t3) * F["n2"]
                 dxx = np.gradient(d[..., 0], sx, axis=1); dxy = -np.gradient(d[..., 0], 1 / fh, axis=0)
                 dyx = np.gradient(d[..., 1], sx, axis=1); dyy = -np.gradient(d[..., 1], 1 / fh, axis=0)
                 worst = min(worst, float(((1 - dxx) * (1 - dyy) - dxy * dyx).min()))
@@ -327,10 +339,10 @@ def build_cell_fields(cells, w, h, seed=7):
 
     scale = 1.0
     jac = min_jacobian(scale)
-    while jac < 0.35 and scale > 0.3:
+    while jac < 0.30 and scale > 0.3:
         scale *= 0.9
         jac = min_jacobian(scale)
-    for k in F:
+    for k in ("s1", "c1", "s2", "c2"):
         F[k] *= scale
     peak = max(float(np.abs(F[k]).max()) for k in F)
     global CELL_FIELD_RANGE
@@ -338,11 +350,11 @@ def build_cell_fields(cells, w, h, seed=7):
     CELL_STATS.update({"cells": int(len(ccx)), "amplitude_scale": round(scale, 3),
                        "min_jacobian": round(jac, 3), "max_basis_displacement_px": round(peak * h, 1)})
     enc = lambda v: v / CELL_FIELD_RANGE + 0.5
-    zero = np.full((fh, fw, 1), 0.5, np.float32)
-    return {   # 8 scalar fields packed into three RGB textures
+    return {   # 12 scalar fields packed into four RGB textures
         "cells_a": _save_png16("cells_a", enc(np.concatenate([F["s1"], F["c1"][..., :1]], -1))),
         "cells_b": _save_png16("cells_b", enc(np.concatenate([F["c1"][..., 1:], F["s2"]], -1))),
-        "cells_c": _save_png16("cells_c", np.concatenate([enc(F["c2"]), zero], -1)),
+        "cells_c": _save_png16("cells_c", enc(np.concatenate([F["c2"], F["n1"][..., :1]], -1))),
+        "cells_d": _save_png16("cells_d", enc(np.concatenate([F["n1"][..., 1:], F["n2"]], -1))),
     }
 
 
@@ -406,6 +418,12 @@ def build_layers(ref_path):
     for name, wt in (("layer_centre", w_c), ("layer_foam_tr", w_tr), ("layer_foam_bl", w_bl)):
         layer = _resample(lin * wt[..., None], out_w, out_h)
         paths[name] = _save_png16(name, np.clip(layer, 0, 1))
+
+    # Where each bubble layer can show anything, dilated by the largest possible
+    # displacement (cell warp + ripple + cluster float); used to trim the planes.
+    for name, wt in (("layer_foam_tr", w_tr), ("layer_foam_bl", w_bl)):
+        occ_q = _maxpool((wt * lum) > 0.004, 4)
+        SUPPORT[name] = _dilate(occ_q, int(70 / 4) + 1)
 
     cells = detect_cells(lum, w_tr + w_bl)
     np.savez(os.path.join(TEX_DIR, "cells.npz"), cx=cells[0], cy=cells[1], r=cells[2])
@@ -538,7 +556,7 @@ def bubble_material(name, clock, layer_img, field_imgs, ripple_offset):
     """Living bubbles: the cluster layer is resampled through a periodic per-bubble warp
 
         uv' = uv - d(uv, t),
-        d = sin(th1) S1 + cos(th1) C1 + sin(th2) S2 + cos(th2) C2 + ripple,
+        d = sin(th1) S1 + cos(th1) C1 + sin(th2) S2 + cos(th2) C2 + cos(th3) N1 + sin(th3) N2,
         th_k = 2 pi K p.
     """
     mat = bpy.data.materials.new(name)
@@ -560,23 +578,16 @@ def bubble_material(name, clock, layer_img, field_imgs, ripple_offset):
         nb.link(t.outputs["Color"], sc.inputs[0])
         return [nb.mul(nb.sub(sc.outputs[i], 0.5), CELL_FIELD_RANGE * AMP) for i in range(3)]
 
-    fa, fb, fc = fetch(field_imgs["cells_a"]), fetch(field_imgs["cells_b"]), fetch(field_imgs["cells_c"])
+    fa, fb = fetch(field_imgs["cells_a"]), fetch(field_imgs["cells_b"])
+    fc, fd = fetch(field_imgs["cells_c"]), fetch(field_imgs["cells_d"])
     S1, C1, S2, C2 = (fa[0], fa[1]), (fa[2], fb[0]), (fb[1], fb[2]), (fc[0], fc[1])
+    N1, N2 = (fc[2], fd[0]), (fd[1], fd[2])
+    th3 = nb.angle(p, K_RIPPLE, ripple_offset)
+    s3, c3 = nb.math("SINE", th3), nb.math("COSINE", th3)
     dx = nb.add(nb.add(nb.mul(s1, S1[0]), nb.mul(c1, C1[0])), nb.add(nb.mul(s2, S2[0]), nb.mul(c2, C2[0])))
     dy = nb.add(nb.add(nb.mul(s1, S1[1]), nb.mul(c1, C1[1])), nb.add(nb.mul(s2, S2[1]), nb.mul(c2, C2[1])))
-
-    # Fine membrane ripple: 4-D noise sampled on a circle (R cos th, R sin th) in its
-    # last two dimensions, which is exactly periodic in the loop phase.
-    ang = nb.angle(p, K_RIPPLE, ripple_offset)
-    wn = nb.node("ShaderNodeTexNoise", noise_dimensions="4D")
-    nb.link(nb.combine(nb.mul(s[0], ASPECT * 14.0), nb.mul(s[1], 14.0),
-                       nb.mul(nb.math("COSINE", ang), 0.9)), wn.inputs["Vector"])
-    nb.link(nb.mul(nb.math("SINE", ang), 0.9), wn.inputs["W"])
-    wn.inputs["Detail"].default_value = 1.0
-    wc = nb.node("ShaderNodeSeparateColor")
-    nb.link(wn.outputs["Color"], wc.inputs[0])
-    dx = nb.add(dx, nb.mul(nb.sub(wc.outputs[0], 0.5), 0.0045 * AMP))
-    dy = nb.add(dy, nb.mul(nb.sub(wc.outputs[1], 0.5), 0.0045 * AMP))
+    dx = nb.add(dx, nb.add(nb.mul(c3, N1[0]), nb.mul(s3, N2[0])))       # membrane ripple
+    dy = nb.add(dy, nb.add(nb.mul(c3, N1[1]), nb.mul(s3, N2[1])))
 
     uvw = nb.combine(nb.sub(s[0], nb.mul(dx, 1.0 / ASPECT)), nb.sub(s[1], dy))
     additive_output(nb, image_node(nb, layer_img, uvw).outputs["Color"])
@@ -587,20 +598,41 @@ def bubble_material(name, clock, layer_img, field_imgs, ripple_offset):
 # 4. Scene assembly
 # ----------------------------------------------------------------------------
 
-def image_plane(name, mat, z, overscan=1.0):
+def image_plane(name, mat, z, overscan=1.0, support=None, grid=(128, 72)):
     """Plane at depth z, scaled so the reference projects onto exactly the frame.
 
     With overscan > 1 the plane is enlarged and its UVs scaled about the centre to
     match, so the image keeps its size while a mirrored margin covers the frame edge.
+    With a `support` mask (rows top-first over the reference) only grid faces that
+    can ever show content are kept: rays elsewhere skip this layer's shader.
     """
     s = (CAM_DIST - z) / CAM_DIST * overscan
-    bpy.ops.mesh.primitive_plane_add(size=1.0, location=(0, 0, z))
-    ob = bpy.context.active_object
-    ob.name = name
+    nx, ny = grid if support is not None else (1, 1)
+    bm = bmesh.new()
+    uv_layer = bm.loops.layers.uv.new("UVMap")
+    verts = [[bm.verts.new((i / nx - 0.5, j / ny - 0.5, 0.0)) for i in range(nx + 1)] for j in range(ny + 1)]
+    to_uv = lambda i, j: ((i / nx - 0.5) * overscan + 0.5, (j / ny - 0.5) * overscan + 0.5)
+    for j in range(ny):
+        for i in range(nx):
+            if support is not None:
+                u0, v0 = to_uv(i, j)
+                u1, v1 = to_uv(i + 1, j + 1)
+                sh, sw = support.shape
+                c0, c1 = int(np.clip(u0, 0, 1) * sw), int(np.ceil(np.clip(u1, 0, 1) * sw))
+                r0, r1 = int((1 - np.clip(v1, 0, 1)) * sh), int(np.ceil((1 - np.clip(v0, 0, 1)) * sh))
+                if not support[r0:max(r1, r0 + 1), c0:max(c1, c0 + 1)].any():
+                    continue
+            face = bm.faces.new((verts[j][i], verts[j][i + 1], verts[j + 1][i + 1], verts[j + 1][i]))
+            for loop, (a, b) in zip(face.loops, ((i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1))):
+                loop[uv_layer].uv = to_uv(a, b)
+    me = bpy.data.meshes.new(name)
+    bm.to_mesh(me)
+    bm.free()
+    ob = bpy.data.objects.new(name, me)
+    bpy.context.scene.collection.objects.link(ob)
+    ob.location = (0, 0, z)
     ob.scale = (IMG_SIZE * ASPECT * s, IMG_SIZE * s, 1.0)
     ob.data.materials.append(mat)
-    for loop_uv in ob.data.uv_layers.active.data:
-        loop_uv.uv = ((loop_uv.uv[0] - 0.5) * overscan + 0.5, (loop_uv.uv[1] - 0.5) * overscan + 0.5)
     return ob
 
 
@@ -625,7 +657,7 @@ def build_scene(paths):
     imgs = {k: load_data_image(v) for k, v in paths.items()}
     for im in imgs.values():
         im.pack()
-    fields = {k: imgs[k] for k in ("cells_a", "cells_b", "cells_c")}
+    fields = {k: imgs[k] for k in ("cells_a", "cells_b", "cells_c", "cells_d")}
 
     # The wordmark and its lines: static, exactly the reference.
     image_plane("Subject", centre_material(imgs["layer_centre"]), 0.0)
@@ -640,7 +672,7 @@ def build_scene(paths):
         px_ = (pivot_uv[0] - 0.5) * IMG_SIZE * ASPECT * s
         py_ = (pivot_uv[1] - 0.5) * IMG_SIZE * s
         mat = bubble_material("M_" + name, clock, imgs[layer], fields, 3.7 + ph)
-        pl = image_plane(name, mat, z, OVERSCAN)
+        pl = image_plane(name, mat, z, OVERSCAN, support=SUPPORT[layer])
         pl.parent = piv
         pl.location = (-px_, -py_, 0.0)
         piv.location = (px_, py_, z)
