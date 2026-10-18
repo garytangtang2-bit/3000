@@ -11,7 +11,7 @@ Options (all optional):
     --seconds S           loop duration (default 16)
     --fps F               frame rate (default 30)
     --res WxH             render resolution (default 3840x2160)
-    --samples N           Cycles anti-aliasing samples (default 16)
+    --samples N           Cycles anti-aliasing samples (default 8)
     --render              render frames after building the scene
     --frames A-B          frame range to render (inclusive, default 0..N-1)
     --frames-dir DIR      where rendered PNG frames go (default OUT/frames/<WxH>)
@@ -47,7 +47,7 @@ def parse_args():
         "seconds": 16.0,
         "fps": 30,
         "res": (3840, 2160),
-        "samples": 16,
+        "samples": 8,
         "render": False,
         "frames": None,
         "frames_dir": None,
