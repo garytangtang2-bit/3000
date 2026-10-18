@@ -94,9 +94,10 @@ N = CFG["n_frames"]
 AMP = 0.0 if CFG["identity"] else 1.0
 
 # Loop frequencies (whole cycles per loop; must be integers for loop closure)
-K_SWELL = 4             # each cell swells and relaxes 4x per loop (every 4 s at 16 s)
-K_DRIFT = 3             # each cell drifts on a small orbit 3x per loop (every 5.3 s)
-K_RIPPLE = 2            # membrane ripple field rotates through its two noise bases 2x per loop
+K_SWELL = 3             # each bubble swells and relaxes 3x per loop (every 5.3 s at 16 s)
+K_DRIFT = 2             # each bubble drifts round a small orbit 2x per loop (every 8 s)
+K_RIPPLE = 1            # membrane ripple rotates through its two noise bases once per loop
+K_FLOAT = 1             # each whole cluster floats round once per loop
 
 # Scene geometry: the 16:9 reference fills the frame at z=0 (frame height = 2 BU).
 CAM_DIST = 5.0          # camera distance from the image plane (BU)
@@ -676,11 +677,11 @@ def build_scene(paths):
         pl.parent = piv
         pl.location = (-px_, -py_, 0.0)
         piv.location = (px_, py_, z)
-        add_driver(piv, "location", f"{px_:.6f} + " + periodic_expr(0.010, 1, ph), 0)
-        add_driver(piv, "location", f"{py_:.6f} + " + periodic_expr(0.008, 1, ph + 1.3), 1)
-        add_driver(piv, "rotation_euler", periodic_expr(math.radians(0.45), 1, ph + 0.5), 2)
+        add_driver(piv, "location", f"{px_:.6f} + " + periodic_expr(0.010, K_FLOAT, ph), 0)
+        add_driver(piv, "location", f"{py_:.6f} + " + periodic_expr(0.008, K_FLOAT, ph + 1.3), 1)
+        add_driver(piv, "rotation_euler", periodic_expr(math.radians(0.45), K_FLOAT, ph + 0.5), 2)
         for ax in range(2):
-            add_driver(piv, "scale", "1.0 + " + periodic_expr(0.008, 1, ph + 2.4), ax)
+            add_driver(piv, "scale", "1.0 + " + periodic_expr(0.008, K_FLOAT, ph + 2.4), ax)
 
     # Locked-off camera.
     cam_data = bpy.data.cameras.new("Camera")
@@ -722,6 +723,7 @@ def build_scene(paths):
     scn.render.image_settings.color_depth = "16"
     scn.render.image_settings.compression = 15
     scn["loop_frames"] = N
+    scn["loop_freqs"] = [K_FLOAT, K_RIPPLE, K_DRIFT, K_SWELL]   # whole cycles per loop, for validation
     scn["loop_fps"] = CFG["fps"]
     return scn
 

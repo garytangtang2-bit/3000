@@ -31,7 +31,7 @@ if "--render-dir" in argv:
 scn = bpy.context.scene
 N = int(scn["loop_frames"])
 report = {"N": N, "fps": scn.render.fps}
-LOOP_FREQS = (1, 3, 4)          # cluster float, bubble drift, bubble swell (cycles per loop)
+LOOP_FREQS = sorted(set(int(k) for k in scn["loop_freqs"]))   # whole cycles per loop used by the scene
 
 
 def sample_channels(frame):
