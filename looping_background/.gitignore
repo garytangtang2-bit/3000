@@ -1,0 +1,8 @@
+# Rendered frame sequences and scratch work (regenerable)
+frames/
+work/
+textures/
+*.blend1
+# Masters exceed GitHub's 100 MB file limit
+looping_background_master.mov
+looping_background_4k_hapq.mov
