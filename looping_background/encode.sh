@@ -7,20 +7,25 @@ cd "$(dirname "$0")"
 FPS=30
 # Colour tags: frames are sRGB-encoded (Standard view transform) -> tag as BT.709.
 TAGS=(-colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv)
+# The bubbles move by sub-pixel amounts per frame. With default x264 decisions those
+# blocks are skipped / their small residuals dropped, error builds up inside each GOP
+# and every keyframe "ticks" (worst at the loop seam, which always starts on an
+# I-frame). Keeping skip and decimation off and I/P/B quality equal removes that.
+X264_LOOP="no-fast-pskip=1:no-dct-decimate=1:ipratio=1.0:pbratio=1.0:deadzone-inter=0:deadzone-intra=0:aq-mode=3"
 
 preview() {
   ffmpeg -y -hide_banner -loglevel error -framerate $FPS -i frames/960x540/%05d.png \
-    -c:v libx264 -preset slow -crf 20 -pix_fmt yuv420p -g $FPS -bf 2 \
+    -c:v libx264 -preset slow -crf 14 -tune grain -pix_fmt yuv420p -g $FPS -x264-params "$X264_LOOP" \
     "${TAGS[@]}" -movflags +faststart preview.mp4
 }
 
 final() {
   local src=frames/3840x2160/%05d.png
-  # H.264 High @ L5.2, near-transparent quality. aq-mode 3 protects dark gradients
-  # from banding; 1 s closed GOPs keep scrubbing / cue jumps in VJ software instant.
+  # H.264 High @ L5.2, near-transparent quality; 1 s closed GOPs keep scrubbing and
+  # cue jumps in VJ software instant.
   ffmpeg -y -hide_banner -loglevel error -framerate $FPS -i $src \
-    -c:v libx264 -preset slow -crf 14 -profile:v high -level:v 5.2 -pix_fmt yuv420p \
-    -g $FPS -keyint_min $FPS -sc_threshold 0 -x264-params "aq-mode=3:aq-strength=0.9" \
+    -c:v libx264 -preset slow -crf 10 -tune grain -profile:v high -level:v 5.2 -pix_fmt yuv420p \
+    -g $FPS -keyint_min $FPS -sc_threshold 0 -x264-params "$X264_LOOP" \
     "${TAGS[@]}" -movflags +faststart looping_background_4k.mp4
   # 10-bit 4:2:2 ProRes 422 HQ master (from 16-bit PNG).
   ffmpeg -y -hide_banner -loglevel error -framerate $FPS -i $src \
